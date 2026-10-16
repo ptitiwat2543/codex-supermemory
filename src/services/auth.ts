@@ -462,7 +462,9 @@ export async function startAuthFlow(timeoutMs = AUTH_TIMEOUT): Promise<string> {
           }
           exchanging = true;
           try {
-            if (url.searchParams.has("error")) throw new Error("Authorization was denied.");
+            if (url.searchParams.has("error")) {
+              throw new AuthError("Authorization was denied.", "access_denied");
+            }
             const code = url.searchParams.get("code");
             if (!code) throw new Error("Authorization code missing.");
             const token = await exchangeToken(
@@ -479,7 +481,11 @@ export async function startAuthFlow(timeoutMs = AUTH_TIMEOUT): Promise<string> {
               .writeHead(200, { "Content-Type": "text/html; charset=utf-8" })
               .end(AUTH_SUCCESS_HTML, () => resolve(token));
           } catch (error) {
-            res.writeHead(400).end("Connection failed. Return to Codex and try login again.");
+            res.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" }).end(
+              error instanceof AuthError && error.code === "access_denied"
+                ? "Authorization denied. Supermemory was not connected. Return to Codex and run login again to retry."
+                : "Connection failed. Return to Codex and try login again.",
+            );
             if (
               error instanceof AuthError &&
               error.code === "invalid_client" &&
