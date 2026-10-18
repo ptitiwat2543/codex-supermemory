@@ -464,6 +464,103 @@ describe("cross-container result merging", () => {
   });
 });
 
+describe("hook recall search mode", () => {
+  const hookModule = new URL("../dist/services/hookRecallClient.js", import.meta.url).href;
+
+  function searchBodyFor(t, fileConfig) {
+    const { tmpDir, codexDir } = setupCodexHome(t);
+    if (fileConfig) writeFileSync(join(codexDir, "supermemory.json"), JSON.stringify(fileConfig));
+    const script = `
+      const bodies = [];
+      const fetchImpl = async (input, init = {}) => {
+        const url = new URL(typeof input === "string" ? input : input.url);
+        if (url.pathname.endsWith("/search")) bodies.push(JSON.parse(init.body));
+        const payload = url.pathname.endsWith("/profile")
+          ? { profile: { static: [], dynamic: [] } }
+          : { results: [], total: 0, searchTime: 1 };
+        return new Response(JSON.stringify(payload), { status: 200, headers: { "content-type": "application/json" } });
+      };
+      const mod = await import(${JSON.stringify(hookModule)});
+      const { getHookProfileWithSearchMany } = mod.default ?? mod;
+      await getHookProfileWithSearchMany(["repo_mode_test"], "what does the catch block do", { fetchImpl, timeoutMs: 2000 });
+      console.log(JSON.stringify(bodies));
+    `;
+    const result = spawnSync("node", ["--input-type=module", "-e", script], {
+      env: {
+        ...process.env,
+        HOME: tmpDir,
+        USERPROFILE: tmpDir,
+        SUPERMEMORY_CODEX_API_KEY: "sm_test_mode_fixture",
+        SUPERMEMORY_API_URL: "https://api.supermemory.ai",
+        SUPERMEMORY_API_VERSION: "v5",
+      },
+      encoding: "utf-8",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const bodies = JSON.parse(result.stdout);
+    assert.equal(bodies.length, 1);
+    return bodies[0];
+  }
+
+  test("defaults to memories search", (t) => {
+    const body = searchBodyFor(t, { recallMode: "direct" });
+    assert.equal(body.searchMode, "memories");
+    assert.equal(body.threshold, 0.6);
+  });
+
+  test("uses hybrid search when recallSearchMode is hybrid", (t) => {
+    const body = searchBodyFor(t, { recallMode: "direct", recallSearchMode: "hybrid" });
+    assert.equal(body.searchMode, "hybrid");
+    assert.equal(body.threshold, 0.6);
+  });
+
+  test("pauses recall after a 402 instead of asking on every prompt", (t) => {
+    const { tmpDir, codexDir } = setupCodexHome(t);
+    writeFileSync(join(codexDir, "supermemory.json"), JSON.stringify({ recallMode: "direct" }));
+    const script = `
+      let calls = 0;
+      const fetchImpl = async () => {
+        calls += 1;
+        return new Response(JSON.stringify({ error: "payment required" }), {
+          status: 402,
+          headers: { "content-type": "application/json" },
+        });
+      };
+      const mod = await import(${JSON.stringify(hookModule)});
+      const { getHookProfileWithSearchMany } = mod.default ?? mod;
+      const first = await getHookProfileWithSearchMany(["repo_limit_test"], "what changed", { fetchImpl, timeoutMs: 2000 });
+      const callsAfterFirst = calls;
+      const second = await getHookProfileWithSearchMany(["repo_limit_test"], "what changed", { fetchImpl, timeoutMs: 2000 });
+      console.log(JSON.stringify({ first: first.success, second: second.success, callsAfterFirst, calls }));
+    `;
+    const result = spawnSync("node", ["--input-type=module", "-e", script], {
+      env: {
+        ...process.env,
+        HOME: tmpDir,
+        USERPROFILE: tmpDir,
+        SUPERMEMORY_CODEX_API_KEY: "sm_test_limit_fixture",
+        SUPERMEMORY_API_URL: "https://api.supermemory.ai",
+        SUPERMEMORY_API_VERSION: "v5",
+      },
+      encoding: "utf-8",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const out = JSON.parse(result.stdout);
+    assert.equal(out.first, false);
+    assert.equal(out.second, false);
+    assert.ok(out.callsAfterFirst > 0);
+    assert.equal(out.calls, out.callsAfterFirst);
+    const cooldown = JSON.parse(readFileSync(join(tmpDir, ".codex-supermemory", "recall-cooldown.json"), "utf-8"));
+    assert.equal(cooldown.status, 402);
+    assert.ok(cooldown.until > Date.now());
+  });
+
+  test("ignores unknown recallSearchMode values", (t) => {
+    const body = searchBodyFor(t, { recallMode: "direct", recallSearchMode: "chunks" });
+    assert.equal(body.searchMode, "memories");
+  });
+});
+
 describe("API v5 profile response validation", () => {
   const clientModule = new URL("../dist/services/client.js", import.meta.url).href;
 
@@ -1410,6 +1507,89 @@ describe("hosted MCP hooks", () => {
     const output = JSON.parse(result.stdout);
     assert.equal(output.error.code, -32001);
     assert.match(output.error.message, /Start a new Codex task/);
+  });
+});
+
+describe("search_hybrid local MCP tool", () => {
+  const proxyModule = new URL("../dist/hooks/mcp-proxy.js", import.meta.url).href;
+
+  // Runs the real proxy with fetch replaced, so neither MCP nor REST leaves the process.
+  function runProxy(t, messages, searchStatus = 200) {
+    const { tmpDir } = setupCodexHome(t);
+    const script = `
+      const calls = [];
+      globalThis.fetch = async (input, init = {}) => {
+        const url = new URL(typeof input === "string" ? input : input.url);
+        const body = init.body ? JSON.parse(init.body) : null;
+        calls.push({ path: url.pathname, body });
+        if (url.pathname.endsWith("/search")) {
+          return new Response(JSON.stringify(${searchStatus} === 200 ? {
+            results: [
+              { id: "c1", chunk: "catch block logs and returns", filepath: "ProcessRun.cs", similarity: 0.71 },
+              { id: "m1", memory: "Decision recorded", similarity: 0.65 },
+            ],
+            total: 2,
+            timing: 1,
+          } : { error: "limit" }), { status: ${searchStatus}, headers: { "content-type": "application/json" } });
+        }
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: { tools: [{ name: "search_memory" }] } }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      };
+      process.on("exit", () => process.stderr.write("CALLS" + JSON.stringify(calls)));
+      await import(${JSON.stringify(proxyModule)});
+    `;
+    const result = spawnSync("node", ["--input-type=module", "-e", script], {
+      input: messages.map((message) => JSON.stringify(message)).join("\n") + "\n",
+      env: {
+        ...process.env,
+        HOME: tmpDir,
+        USERPROFILE: tmpDir,
+        SUPERMEMORY_CODEX_API_KEY: "sm_test_hybrid_fixture",
+        SUPERMEMORY_API_URL: "https://api.supermemory.ai",
+        SUPERMEMORY_API_VERSION: "v5",
+      },
+      encoding: "utf-8",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const calls = JSON.parse(result.stderr.slice(result.stderr.lastIndexOf("CALLS") + 5));
+    const output = result.stdout.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    return { calls, output, tmpDir };
+  }
+
+  const hybridCall = (id) => ({
+    jsonrpc: "2.0",
+    id,
+    method: "tools/call",
+    params: { name: "search_hybrid", arguments: { query: "catch block", namespace: "repo_test" } },
+  });
+
+  test("lists search_hybrid with the hosted tools", (t) => {
+    const { output } = runProxy(t, [{ jsonrpc: "2.0", id: 3, method: "tools/list" }]);
+    assert.deepEqual(output[0].result.tools.map((tool) => tool.name), ["search_memory", "search_hybrid"]);
+  });
+
+  test("answers search_hybrid locally with a hybrid REST search", (t) => {
+    const { calls, output } = runProxy(t, [hybridCall(4)]);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].path, "/ns/repo_test/search");
+    assert.equal(calls[0].body.searchMode, "hybrid");
+    assert.equal(calls[0].body.threshold, 0.6);
+    assert.equal(calls[0].body.rerank, "none");
+    assert.equal(calls[0].body.rewriteQuery, false);
+    assert.equal(output[0].result.isError, false);
+    assert.match(output[0].result.content[0].text, /\[chunk 71%\] catch block logs and returns \(ProcessRun\.cs\)/);
+    assert.match(output[0].result.content[0].text, /\[memory 65%\] Decision recorded/);
+  });
+
+  test("search_hybrid stops calling after a 402", (t) => {
+    const first = runProxy(t, [hybridCall(5), hybridCall(6)], 402);
+    assert.equal(first.calls.length, 1);
+    assert.equal(first.output[0].result.isError, true);
+    assert.match(first.output[1].result.content[0].text, /paused after a usage limit/);
+    const cooldown = JSON.parse(readFileSync(join(first.tmpDir, ".codex-supermemory", "recall-cooldown.json"), "utf-8"));
+    assert.equal(cooldown.status, 402);
   });
 });
 

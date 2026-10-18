@@ -3,6 +3,7 @@ import type { ProfileWithSearchResult, SearchResultItem } from "./client.js";
 import { mergeProfileResults } from "./resultMerge.js";
 import { memoryText, recallProvenance } from "./resultText.js";
 import { createV5Client, readV5Profile, apiErrorMessage } from "./api.js";
+import { isLimitStatus, limitStatus, recallCoolingDown, startRecallCooldown } from "./recallCooldown.js";
 
 export const HOOK_RECALL_TIMEOUT_MS = 3000;
 // Self-hosted backends need a longer cap than hosted; see #61.
@@ -91,7 +92,7 @@ async function fetchProfile(
         timeoutInSeconds: options.timeoutMs / 1000,
         maxRetries: 0,
         abortSignal: controller.signal,
-      });
+      }, CONFIG.recallSearchMode);
     }
     const response = await options.fetchImpl(`${getBaseUrl().replace(/\/+$/, "")}/v4/profile`, {
       method: "POST",
@@ -104,10 +105,13 @@ async function fetchProfile(
       signal: controller.signal,
     });
     if (!response.ok) {
+      if (isLimitStatus(response.status)) startRecallCooldown(response.status);
       return { success: false, error: `Profile request failed (${response.status})`, profile: null };
     }
     return normalizeProfileResponse(await response.json());
   } catch (error) {
+    const status = limitStatus(error);
+    if (status) startRecallCooldown(status);
     return {
       success: false,
       error: apiErrorMessage(error),
@@ -123,6 +127,9 @@ export async function getHookProfileWithSearchMany(
   query: string,
   options: HookRecallOptions = {},
 ): Promise<ProfileWithSearchResult> {
+  if (recallCoolingDown()) {
+    return { success: false, error: "Recall paused after a usage limit", profile: null };
+  }
   const resolved = {
     timeoutMs: options.timeoutMs ?? hookRecallTimeoutMs(),
     fetchImpl: options.fetchImpl ?? fetch,

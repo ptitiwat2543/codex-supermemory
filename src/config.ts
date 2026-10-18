@@ -33,6 +33,7 @@ interface CodexSupermemoryConfig {
   autoRecallEveryPrompt?: boolean;
   recallMode?: RecallMode;
   recallDirective?: string;
+  recallSearchMode?: RecallSearchMode;
   captureEveryNTurns?: number;
 }
 
@@ -61,6 +62,7 @@ const DEFAULTS = {
   autoSaveEveryTurns: 3,
   autoRecallEveryPrompt: false,
   recallMode: "direct" as RecallMode,
+  recallSearchMode: "memories" as RecallSearchMode,
   captureEveryNTurns: 0,
 };
 
@@ -111,6 +113,12 @@ function resolveCaptureEveryNTurns(config: CodexSupermemoryConfig): number {
   return DEFAULTS.captureEveryNTurns;
 }
 
+export type RecallSearchMode = "memories" | "hybrid";
+
+function resolveRecallSearchMode(config: CodexSupermemoryConfig): RecallSearchMode {
+  return config.recallSearchMode === "hybrid" ? "hybrid" : DEFAULTS.recallSearchMode;
+}
+
 function resolveRecallMode(config: CodexSupermemoryConfig): RecallMode {
   if (["direct", "off", "advisory"].includes(config.recallMode ?? "")) {
     return config.recallMode as RecallMode;
@@ -150,6 +158,7 @@ export const CONFIG = {
   signalTurnsBefore: fileConfig.signalTurnsBefore ?? DEFAULTS.signalTurnsBefore,
   autoSaveEveryTurns: fileConfig.autoSaveEveryTurns ?? DEFAULTS.autoSaveEveryTurns,
   recallMode,
+  recallSearchMode: resolveRecallSearchMode(fileConfig),
   recallDirective:
     typeof fileConfig.recallDirective === "string" && fileConfig.recallDirective.trim()
       ? fileConfig.recallDirective.trim()

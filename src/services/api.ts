@@ -1,5 +1,5 @@
 import Supermemory, { SupermemoryError, type FilterExpression, type RequestOptions } from "supermemory";
-import { getApiKeyValue, getBaseUrl } from "../config.js";
+import { getApiKeyValue, getBaseUrl, type RecallSearchMode } from "../config.js";
 import type { ProfileWithSearchResult, SearchResultItem, MemoryScope } from "./client.js";
 import { memoryText, recallProvenance } from "./resultText.js";
 
@@ -74,26 +74,38 @@ export function normalizeSearchItem(item: SearchResultItem): SearchResultItem {
   };
 }
 
+export async function searchV5(
+  client: Supermemory,
+  namespace: string,
+  query: string,
+  searchMode: RecallSearchMode,
+  filter?: FilterExpression,
+  requestOptions?: RequestOptions,
+) {
+  return client.search(namespace, {
+    query,
+    filter,
+    searchMode,
+    threshold: 0.6,
+    limit: 10,
+    rerank: "none",
+    rewriteQuery: false,
+    include: { documents: false, related: false, forgotten: false },
+  }, requestOptions);
+}
+
 export async function readV5Profile(
   client: Supermemory,
   namespace: string,
   query?: string,
   scope?: MemoryScope,
   requestOptions?: RequestOptions,
+  searchMode: RecallSearchMode = "memories",
 ): Promise<ProfileWithSearchResult> {
   const filter = scopeFilter(scope);
   const [profileResponse, search] = await Promise.all([
     client.profile(namespace, { filter }, requestOptions),
-    query ? client.search(namespace, {
-      query,
-      filter,
-      searchMode: "memories",
-      threshold: 0.6,
-      limit: 10,
-      rerank: "none",
-      rewriteQuery: false,
-      include: { documents: false, related: false, forgotten: false },
-    }, requestOptions) : undefined,
+    query ? searchV5(client, namespace, query, searchMode, filter, requestOptions) : undefined,
   ]);
   const profile = profileSections(profileResponse?.profile);
   const results = search?.results.map(normalizeSearchItem).map((item) => ({
