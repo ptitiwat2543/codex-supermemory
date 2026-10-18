@@ -28,11 +28,40 @@ export function scopeFilter(scope?: MemoryScope): FilterExpression | undefined {
 }
 
 export function profileFacts(value: unknown): string[] {
-  if (!Array.isArray(value)) return [];
-  return value.map((fact) => typeof fact === "string"
-    ? fact
-    : fact && typeof fact === "object" ? memoryText(fact) : "")
-    .filter((fact) => fact.trim().length > 0);
+  if (!Array.isArray(value)) {
+    throw new Error("Malformed Supermemory profile: facts must be an array");
+  }
+
+  return value.map((fact, index) => {
+    if (typeof fact === "string") {
+      if (fact.trim().length === 0) {
+        throw new Error(`Malformed Supermemory profile: fact ${index} has no text`);
+      }
+      return fact;
+    }
+
+    if (!fact || typeof fact !== "object" || Array.isArray(fact)) {
+      throw new Error(`Malformed Supermemory profile: fact ${index} is not a memory`);
+    }
+
+    const text = memoryText(fact);
+    if (text.length === 0) {
+      throw new Error(`Malformed Supermemory profile: fact ${index} has no text`);
+    }
+    return text;
+  });
+}
+
+function profileSections(value: unknown): { static: string[]; dynamic: string[] } {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Malformed Supermemory profile: profile envelope is missing");
+  }
+
+  const profile = value as Record<string, unknown>;
+  return {
+    static: profileFacts(profile.static),
+    dynamic: profileFacts(profile.dynamic),
+  };
 }
 
 export function normalizeSearchItem(item: SearchResultItem): SearchResultItem {
@@ -53,7 +82,7 @@ export async function readV5Profile(
   requestOptions?: RequestOptions,
 ): Promise<ProfileWithSearchResult> {
   const filter = scopeFilter(scope);
-  const [profile, search] = await Promise.all([
+  const [profileResponse, search] = await Promise.all([
     client.profile(namespace, { filter }, requestOptions),
     query ? client.search(namespace, {
       query,
@@ -66,6 +95,7 @@ export async function readV5Profile(
       include: { documents: false, related: false, forgotten: false },
     }, requestOptions) : undefined,
   ]);
+  const profile = profileSections(profileResponse?.profile);
   const results = search?.results.map(normalizeSearchItem).map((item) => ({
     ...item,
     memory: memoryText(item),
@@ -73,8 +103,8 @@ export async function readV5Profile(
   return {
     success: true,
     profile: {
-      static: profileFacts(profile.profile?.static),
-      dynamic: profileFacts(profile.profile?.dynamic),
+      static: profile.static,
+      dynamic: profile.dynamic,
     },
     searchResults: results ? { results, total: results.length, timing: search?.searchTime } : undefined,
   };

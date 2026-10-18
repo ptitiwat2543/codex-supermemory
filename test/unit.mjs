@@ -48,6 +48,16 @@ function hash16(input) {
   return createHash("sha256").update(input).digest("hex").slice(0, 16);
 }
 
+function matchesHookCommand(command, script) {
+  if (command === `node ${script}`) return true;
+
+  const encoded = /^node -e "require\(Buffer\.from\('([A-Za-z0-9+/]+={0,2})','base64'\)\.toString\('utf-8'\)\)"$/.exec(command);
+  if (!encoded || Buffer.from(encoded[1], "base64").toString("base64") !== encoded[1]) {
+    return false;
+  }
+  return Buffer.from(encoded[1], "base64").toString("utf-8") === script;
+}
+
 function readGeneratedPetPng(path) {
   const png = readFileSync(path);
   let offset = 8;
@@ -116,6 +126,38 @@ describe("container tags", () => {
     });
     assert.equal(result.status, 0, `getPersonalTag failed: ${result.stderr}`);
     return result.stdout.trim();
+  }
+
+  function runWithFakeGit(script, cwd, home, t) {
+    const preloadPath = join(home, "fake-git-preload.cjs");
+    writeFileSync(preloadPath, `
+      const childProcess = require("node:child_process");
+      const { syncBuiltinESMExports } = require("node:module");
+      const originalExecSync = childProcess.execSync;
+      childProcess.execSync = (command, options = {}) => {
+        const text = String(command).trim();
+        const state = globalThis.__fakeGitState;
+        if (!text.startsWith("git ") || !state) return originalExecSync(command, options);
+        const gitCommand = text.slice(4);
+        state.calls.push({ command: gitCommand, cwd: options.cwd });
+        if (state.failAll) throw new Error("fake git failure");
+        if (gitCommand === "rev-parse --git-common-dir") return ".git\\n";
+        if (gitCommand === "rev-parse --show-toplevel") return state.root + "\\n";
+        if (gitCommand === "remote get-url origin") return state.remote + "\\n";
+        if (gitCommand === "config user.email") return state.email + "\\n";
+        throw new Error("unexpected fake git command: " + gitCommand);
+      };
+      syncBuiltinESMExports();
+    `);
+    return spawnSync("node", ["--require", preloadPath, "--input-type=module", "-e", script, cwd], {
+      env: {
+        ...process.env,
+        HOME: home,
+        USERPROFILE: home,
+        SUPERMEMORY_CODEX_API_KEY: "sm_test",
+      },
+      encoding: "utf-8",
+    });
   }
 
   test("canonical tag uses the shared git common directory for worktrees", (t) => {
@@ -254,6 +296,79 @@ describe("container tags", () => {
     assert.ok(tags.personalReads.includes("shared_personal"));
     assert.equal(tags.projectReads[0], "shared_project");
   });
+
+  test("resolves all tags with at most five Git subprocesses per invocation", (t) => {
+    const tmpDir = makeTmpDir();
+    t.after(() => rmSync(tmpDir, { recursive: true, force: true }));
+    const homeDir = join(tmpDir, "home");
+    mkdirSync(homeDir, { recursive: true });
+    const script = `
+      globalThis.__fakeGitState = {
+        calls: [],
+        root: "/fixture/first-repo",
+        remote: "git@github.com:acme/First.Project.git",
+        email: "first@example.com",
+      };
+      const { getTags } = await import(${JSON.stringify(tagsModule)});
+      const cwd = process.argv.at(-1);
+      const first = getTags(cwd);
+      const firstCalls = globalThis.__fakeGitState.calls.splice(0);
+      globalThis.__fakeGitState.root = "/fixture/second-repo";
+      globalThis.__fakeGitState.remote = "git@github.com:acme/Second.Project.git";
+      globalThis.__fakeGitState.email = "second@example.com";
+      const second = getTags(cwd);
+      const secondCalls = globalThis.__fakeGitState.calls.splice(0);
+      console.log(JSON.stringify({ first, firstCalls, second, secondCalls }));
+    `;
+    const result = runWithFakeGit(script, "/fixture/working", homeDir, t);
+    assert.equal(result.status, 0, result.stderr);
+    const { first, firstCalls, second, secondCalls } = JSON.parse(result.stdout);
+
+    assert.equal(first.projectName, "First.Project");
+    assert.equal(first.projectId, hash16("github.com/acme/first.project"));
+    assert.ok(first.personalReads.includes(`codex_user_${hash16("first@example.com")}`));
+    assert.equal(second.projectName, "Second.Project");
+    assert.equal(second.projectId, hash16("github.com/acme/second.project"));
+    assert.ok(second.personalReads.includes(`codex_user_${hash16("second@example.com")}`));
+    assert.notDeepEqual(first, second);
+    assert.ok(firstCalls.length <= 5, `first getTags() ran ${firstCalls.length} Git commands`);
+    assert.ok(secondCalls.length <= 5, `second getTags() ran ${secondCalls.length} Git commands`);
+    t.diagnostic(`getTags() Git command counts: first=${firstCalls.length}, second=${secondCalls.length}`);
+  });
+
+  test("does not retain failed Git resolution across getTags invocations", (t) => {
+    const tmpDir = makeTmpDir();
+    t.after(() => rmSync(tmpDir, { recursive: true, force: true }));
+    const homeDir = join(tmpDir, "home");
+    mkdirSync(homeDir, { recursive: true });
+    const script = `
+      globalThis.__fakeGitState = {
+        calls: [],
+        root: "/fixture/recovered-repo",
+        remote: "git@github.com:acme/Recovered.Project.git",
+        email: "recovered@example.com",
+        failAll: true,
+      };
+      const { getTags } = await import(${JSON.stringify(tagsModule)});
+      const cwd = process.argv.at(-1);
+      const failed = getTags(cwd);
+      const failedCalls = globalThis.__fakeGitState.calls.splice(0);
+      globalThis.__fakeGitState.failAll = false;
+      const recovered = getTags(cwd);
+      const recoveredCalls = globalThis.__fakeGitState.calls.splice(0);
+      console.log(JSON.stringify({ failed, failedCalls, recovered, recoveredCalls }));
+    `;
+    const result = runWithFakeGit(script, "/fixture/recoverable", homeDir, t);
+    assert.equal(result.status, 0, result.stderr);
+    const { failed, failedCalls, recovered, recoveredCalls } = JSON.parse(result.stdout);
+
+    assert.equal(failed.projectName, "recoverable");
+    assert.equal(recovered.projectName, "Recovered.Project");
+    assert.equal(recovered.projectId, hash16("github.com/acme/recovered.project"));
+    assert.ok(failedCalls.length > 0);
+    assert.ok(recoveredCalls.length <= 5, `recovered getTags() ran ${recoveredCalls.length} Git commands`);
+    t.diagnostic(`getTags() Git command counts after failure: failed=${failedCalls.length}, recovered=${recoveredCalls.length}`);
+  });
 });
 
 describe("cross-container result merging", () => {
@@ -346,6 +461,92 @@ describe("cross-container result merging", () => {
     assert.ok(results[1].memory.length > 300);
     assert.notEqual(results[1].memory, results[2].memory);
     assert.ok(!results.some((item) => item.memory === "weak score only"));
+  });
+});
+
+describe("API v5 profile response validation", () => {
+  const clientModule = new URL("../dist/services/client.js", import.meta.url).href;
+
+  function readProfileResponse(profilePayload, t) {
+    const { tmpDir } = setupCodexHome(t);
+    const script = `
+      const payload = JSON.parse(process.argv.at(-1));
+      const requests = [];
+      globalThis.fetch = async (input, init = {}) => {
+        const url = new URL(typeof input === "string" ? input : input.url);
+        requests.push({ method: init.method ?? input.method ?? "GET", url: url.pathname });
+        return new Response(JSON.stringify(payload), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      };
+      const { SupermemoryClient } = await import(${JSON.stringify(clientModule)});
+      const client = new SupermemoryClient();
+      const result = await client.getProfileWithSearch("repo_profile_test");
+      console.log(JSON.stringify({ result, requests }));
+    `;
+    const result = spawnSync("node", ["--input-type=module", "-e", script, JSON.stringify(profilePayload)], {
+      env: {
+        ...process.env,
+        HOME: tmpDir,
+        USERPROFILE: tmpDir,
+        SUPERMEMORY_CODEX_API_KEY: "sm_test_profile_fixture",
+        SUPERMEMORY_API_URL: "https://api.supermemory.ai",
+        SUPERMEMORY_API_VERSION: "v5",
+      },
+      encoding: "utf-8",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    return JSON.parse(result.stdout);
+  }
+
+  test("rejects a missing or malformed profile envelope instead of treating it as empty", (t) => {
+    for (const payload of [
+      {},
+      { profile: null },
+      { profile: [] },
+      { profile: { dynamic: [] } },
+      { profile: { static: [], dynamic: null } },
+    ]) {
+      const { result, requests } = readProfileResponse(payload, t);
+      assert.equal(result.success, false, JSON.stringify(payload));
+      assert.equal(result.profile, null);
+      assert.match(result.error, /profile/i);
+      assert.deepEqual(requests, [{ method: "POST", url: "/ns/repo_profile_test/profile" }]);
+    }
+  });
+
+  test("rejects malformed static and dynamic facts instead of dropping them", (t) => {
+    for (const profile of [
+      { static: [null], dynamic: [] },
+      { static: [{ id: "mem_missing_text" }], dynamic: [] },
+      { static: [], dynamic: [42] },
+      { static: ["   "], dynamic: [] },
+    ]) {
+      const { result } = readProfileResponse({ profile }, t);
+      assert.equal(result.success, false, JSON.stringify(profile));
+      assert.equal(result.profile, null);
+      assert.match(result.error, /profile/i);
+    }
+  });
+
+  test("accepts valid empty sections and preserves string and v5 memory facts", (t) => {
+    const empty = readProfileResponse({ profile: { static: [], dynamic: [], buckets: {} } }, t);
+    assert.equal(empty.result.success, true, JSON.stringify(empty));
+    assert.deepEqual(empty.result.profile, { static: [], dynamic: [] });
+
+    const populated = readProfileResponse({
+      profile: {
+        static: ["A string profile fact"],
+        dynamic: [{ id: "mem_profile_1", memory: "A v5 object profile fact" }],
+        buckets: {},
+      },
+    }, t);
+    assert.equal(populated.result.success, true, JSON.stringify(populated));
+    assert.deepEqual(populated.result.profile, {
+      static: ["A string profile fact"],
+      dynamic: ["A v5 object profile fact"],
+    });
   });
 });
 
@@ -930,7 +1131,12 @@ describe("integration: install/uninstall", () => {
   test("install registers synchronous recall hooks and background capture", (t) => {
     const { tmpDir, codexDir } = setupCodexHome(t);
     const hooksPath = join(codexDir, "hooks.json");
-    const flushCmd = `node ${join(codexDir, "supermemory", "flush.js")}`;
+    const flushScript = join(codexDir, "supermemory", "flush.js");
+    const flushCmd = `node ${flushScript}`;
+    const encodedFlushCmd = `node -e "require(Buffer.from('${Buffer.from(flushScript, "utf-8").toString("base64")}','base64').toString('utf-8'))"`;
+    assert.equal(matchesHookCommand(encodedFlushCmd, flushScript), true);
+    assert.equal(matchesHookCommand(`${encodedFlushCmd} extra`, flushScript), false);
+    assert.equal(matchesHookCommand(encodedFlushCmd, `${flushScript}.bak`), false);
     writeFileSync(hooksPath, JSON.stringify({
       hooks: {
         Stop: [{ hooks: [{ type: "command", command: flushCmd, timeout: 60 }] }],
@@ -942,16 +1148,19 @@ describe("integration: install/uninstall", () => {
 
     const hooks = JSON.parse(readFileSync(hooksPath, "utf-8")).hooks;
     const stop = hooks.Stop.flatMap((group) => group.hooks)
-      .find((hook) => hook.command === flushCmd);
+      .find((hook) => matchesHookCommand(hook.command, flushScript));
+    const recallScript = join(codexDir, "supermemory", "recall.js");
     const recall = hooks.UserPromptSubmit.flatMap((group) => group.hooks)
-      .find((hook) => hook.command.endsWith("/recall.js"));
+      .find((hook) => matchesHookCommand(hook.command, recallScript));
+    const recallApproveScript = join(codexDir, "supermemory", "recall-approve.js");
     const recallApprove = hooks.PreToolUse.flatMap((group) => group.hooks)
-      .find((hook) => hook.command.endsWith("/recall-approve.js"));
+      .find((hook) => matchesHookCommand(hook.command, recallApproveScript));
     const recallApproveGroup = hooks.PreToolUse.find((group) =>
       group.hooks.includes(recallApprove)
     );
+    const sessionStartScript = join(codexDir, "supermemory", "session-start.js");
     const sessionStart = hooks.SessionStart.flatMap((group) => group.hooks)
-      .find((hook) => hook.command.endsWith("/session-start.js"));
+      .find((hook) => matchesHookCommand(hook.command, sessionStartScript));
 
     assert.deepEqual(
       { async: stop.async, timeout: stop.timeout },

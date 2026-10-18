@@ -14,7 +14,14 @@ const repoInfoCache = new Map<
   { name: string | null; normalizedRemote: string | null }
 >();
 
-function getGitRoot(directory: string): string | null {
+interface GitResolutionContext {
+  gitRoots: Map<string, string | null>;
+  gitEmails: Map<string, string | null>;
+}
+
+let activeGitResolutionContext: GitResolutionContext | null = null;
+
+function getGitRootUncached(directory: string): string | null {
   const isolateWorktrees = process.env.SUPERMEMORY_ISOLATE_WORKTREES === "true";
 
   try {
@@ -58,11 +65,22 @@ function getGitRoot(directory: string): string | null {
   }
 }
 
+function getGitRoot(directory: string): string | null {
+  const context = activeGitResolutionContext;
+  if (context?.gitRoots.has(directory)) {
+    return context.gitRoots.get(directory) ?? null;
+  }
+
+  const gitRoot = getGitRootUncached(directory);
+  context?.gitRoots.set(directory, gitRoot);
+  return gitRoot;
+}
+
 function getProjectBasePath(directory: string): string {
   return getGitRoot(directory) || resolve(directory);
 }
 
-function getGitEmail(directory: string): string | null {
+function getGitEmailUncached(directory: string): string | null {
   try {
     const email = execSync("git config user.email", {
       cwd: getProjectBasePath(directory),
@@ -73,6 +91,17 @@ function getGitEmail(directory: string): string | null {
   } catch {
     return null;
   }
+}
+
+function getGitEmail(directory: string): string | null {
+  const context = activeGitResolutionContext;
+  if (context?.gitEmails.has(directory)) {
+    return context.gitEmails.get(directory) ?? null;
+  }
+
+  const email = getGitEmailUncached(directory);
+  context?.gitEmails.set(directory, email);
+  return email;
 }
 
 export function normalizeGitRemote(remoteUrl: string): string | null {
@@ -514,15 +543,27 @@ export interface ResolvedTags {
 }
 
 export function getTags(directory: string): ResolvedTags {
-  const canonical = getProjectTag(directory);
-  return {
-    canonical,
-    user: canonical,
-    project: canonical,
-    projectId: getProjectIdentity(directory),
-    projectName: getProjectName(directory),
-    personalReads: getPersonalReadTags(directory),
-    projectReads: getProjectReadTags(directory),
-    allReads: getAllReadTags(directory),
+  const previousContext = activeGitResolutionContext;
+  activeGitResolutionContext = {
+    gitRoots: new Map(),
+    gitEmails: new Map(),
   };
+
+  try {
+    const canonical = getProjectTag(directory);
+    const personalReads = getPersonalReadTags(directory);
+    const projectReads = getProjectReadTags(directory);
+    return {
+      canonical,
+      user: canonical,
+      project: canonical,
+      projectId: getProjectIdentity(directory),
+      projectName: getProjectName(directory),
+      personalReads,
+      projectReads,
+      allReads: uniqueTags([...personalReads, ...projectReads]),
+    };
+  } finally {
+    activeGitResolutionContext = previousContext;
+  }
 }
