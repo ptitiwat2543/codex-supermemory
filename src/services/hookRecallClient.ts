@@ -2,7 +2,7 @@ import { CONFIG, getApiKeyValue, getBaseUrl, getApiVersion } from "../config.js"
 import type { ProfileWithSearchResult, SearchResultItem } from "./client.js";
 import { mergeProfileResults } from "./resultMerge.js";
 import { memoryText, recallProvenance } from "./resultText.js";
-import { createV5Client, readV5Profile, apiErrorMessage } from "./api.js";
+import { createV5Client, readV5Search, apiErrorMessage } from "./api.js";
 import { isLimitStatus, limitStatus, recallCoolingDown, startRecallCooldown } from "./recallCooldown.js";
 
 export const HOOK_RECALL_TIMEOUT_MS = 3000;
@@ -88,7 +88,7 @@ async function fetchProfile(
   const timeout = setTimeout(() => controller.abort(), options.timeoutMs);
   try {
     if (getApiVersion() === "v5") {
-      return await readV5Profile(createV5Client(options.fetchImpl), containerTag, query, undefined, {
+      return await readV5Search(createV5Client(options.fetchImpl), containerTag, query, {
         timeoutInSeconds: options.timeoutMs / 1000,
         maxRetries: 0,
         abortSignal: controller.signal,

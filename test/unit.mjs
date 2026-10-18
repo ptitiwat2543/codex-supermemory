@@ -561,6 +561,48 @@ describe("hook recall search mode", () => {
   });
 });
 
+describe("hook recall requests", () => {
+  const hookModule = new URL("../dist/services/hookRecallClient.js", import.meta.url).href;
+
+  // The prompt hook only injects search hits. A slow /profile used to hold the
+  // hook and, past the 3 s abort, dropped search results that had arrived.
+  test("asks only /search, not /profile, and keeps hits when /profile would hang", (t) => {
+    const { tmpDir } = setupCodexHome(t);
+    const script = `
+      const paths = [];
+      const fetchImpl = async (input, init = {}) => {
+        const url = new URL(typeof input === "string" ? input : input.url);
+        paths.push(url.pathname);
+        if (url.pathname.endsWith("/profile")) {
+          return new Promise((_resolve, reject) => init.signal?.addEventListener("abort", () => reject(init.signal.reason)));
+        }
+        return new Response(JSON.stringify({ results: [{ id: "m1", memory: "chose drizzle", similarity: 0.9 }], total: 1, searchTime: 1 }),
+          { status: 200, headers: { "content-type": "application/json" } });
+      };
+      const mod = await import(${JSON.stringify(hookModule)});
+      const { getHookProfileWithSearchMany } = mod.default ?? mod;
+      const result = await getHookProfileWithSearchMany(["repo_req_test"], "what does the catch block do", { fetchImpl, timeoutMs: 1500 });
+      console.log(JSON.stringify({ paths, success: result.success, hits: result.searchResults?.results?.length ?? 0 }));
+    `;
+    const result = spawnSync("node", ["--input-type=module", "-e", script], {
+      env: {
+        ...process.env,
+        HOME: tmpDir,
+        USERPROFILE: tmpDir,
+        SUPERMEMORY_CODEX_API_KEY: "sm_test_request_fixture",
+        SUPERMEMORY_API_URL: "https://api.supermemory.ai",
+        SUPERMEMORY_API_VERSION: "v5",
+      },
+      encoding: "utf-8",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const out = JSON.parse(result.stdout);
+    assert.deepEqual(out.paths, ["/ns/repo_req_test/search"]);
+    assert.equal(out.success, true);
+    assert.equal(out.hits, 1);
+  });
+});
+
 describe("API v5 profile response validation", () => {
   const clientModule = new URL("../dist/services/client.js", import.meta.url).href;
 

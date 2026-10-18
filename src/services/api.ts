@@ -108,16 +108,32 @@ export async function readV5Profile(
     query ? searchV5(client, namespace, query, searchMode, filter, requestOptions) : undefined,
   ]);
   const profile = profileSections(profileResponse?.profile);
-  const results = search?.results.map(normalizeSearchItem).map((item) => ({
-    ...item,
-    memory: memoryText(item),
-  })).filter((item) => item.memory.length > 0);
   return {
     success: true,
     profile: {
       static: profile.static,
       dynamic: profile.dynamic,
     },
-    searchResults: results ? { results, total: results.length, timing: search?.searchTime } : undefined,
+    searchResults: searchResultsOf(search),
   };
+}
+
+function searchResultsOf(search: Awaited<ReturnType<typeof searchV5>> | undefined) {
+  const results = search?.results.map(normalizeSearchItem).map((item) => ({
+    ...item,
+    memory: memoryText(item),
+  })).filter((item) => item.memory.length > 0);
+  return results ? { results, total: results.length, timing: search?.searchTime } : undefined;
+}
+
+// The prompt hook injects only search hits, so it skips the slower /profile call.
+export async function readV5Search(
+  client: Supermemory,
+  namespace: string,
+  query: string,
+  requestOptions?: RequestOptions,
+  searchMode: RecallSearchMode = "memories",
+): Promise<ProfileWithSearchResult> {
+  const search = await searchV5(client, namespace, query, searchMode, undefined, requestOptions);
+  return { success: true, profile: { static: [], dynamic: [] }, searchResults: searchResultsOf(search) };
 }
