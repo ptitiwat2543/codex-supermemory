@@ -4,6 +4,7 @@ import { mergeProfileResults } from "./resultMerge.js";
 import { memoryText, recallProvenance } from "./resultText.js";
 import { createV5Client, readV5Search, apiErrorMessage } from "./api.js";
 import { isLimitStatus, limitStatus, recallCoolingDown, startRecallCooldown } from "./recallCooldown.js";
+import { namespaceIsEmpty, planNamespaces, recordContents } from "./namespaceContents.js";
 
 export const HOOK_RECALL_TIMEOUT_MS = 3000;
 // Self-hosted backends need a longer cap than hosted; see #61.
@@ -23,6 +24,8 @@ export function hookRecallTimeoutMs(baseUrl = getBaseUrl()): number {
 interface HookRecallOptions {
   timeoutMs?: number;
   fetchImpl?: typeof fetch;
+  /** Namespaces this plugin writes to; they are searched even when a check found them empty. */
+  writeTags?: string[];
 }
 
 function stringFacts(value: unknown): string[] {
@@ -79,7 +82,7 @@ function normalizeProfileResponse(raw: unknown): ProfileWithSearchResult {
 async function fetchProfile(
   containerTag: string,
   query: string,
-  options: Required<HookRecallOptions>,
+  options: Required<Pick<HookRecallOptions, "timeoutMs" | "fetchImpl">>,
 ): Promise<ProfileWithSearchResult> {
   const apiKey = getApiKeyValue();
   if (!apiKey) return { success: false, error: "Missing API key", profile: null };
@@ -135,8 +138,34 @@ export async function getHookProfileWithSearchMany(
     fetchImpl: options.fetchImpl ?? fetch,
   };
   const uniqueTags = [...new Set(containerTags.filter(Boolean))];
-  const results = await Promise.all(
-    uniqueTags.map((containerTag) => fetchProfile(containerTag, query, resolved)),
-  );
-  return mergeProfileResults(results, CONFIG.maxMemories);
+  if (getApiVersion() !== "v5") {
+    const results = await Promise.all(uniqueTags.map((containerTag) => fetchProfile(containerTag, query, resolved)));
+    return mergeProfileResults(results, CONFIG.maxMemories);
+  }
+  const plan = planNamespaces(uniqueTags, options.writeTags);
+  // Content checks run beside the searches and stop at the same budget, so the prompt never waits longer.
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<undefined>((resolve) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      resolve(undefined);
+    }, resolved.timeoutMs);
+  });
+  const client = createV5Client(resolved.fetchImpl);
+  const checkOptions = { timeoutInSeconds: resolved.timeoutMs / 1000, maxRetries: 0, abortSignal: controller.signal };
+  try {
+    const [results, checks] = await Promise.all([
+      Promise.all(plan.search.map((containerTag) => fetchProfile(containerTag, query, resolved))),
+      Promise.all(plan.check.map(async (tag) =>
+        [tag, await Promise.race([namespaceIsEmpty(client, tag, checkOptions), late])] as const)),
+    ]);
+    recordContents(new Map(checks));
+    if (!plan.search.length) {
+      return { success: true, profile: { static: [], dynamic: [] }, searchResults: { results: [], total: 0 } };
+    }
+    return mergeProfileResults(results, CONFIG.maxMemories);
+  } finally {
+    clearTimeout(timer);
+  }
 }

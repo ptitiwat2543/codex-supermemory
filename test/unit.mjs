@@ -21,6 +21,14 @@ function makeTmpDir() {
   return dir;
 }
 
+// A child process that keeps the real HOME writes to ~/.codex-supermemory.log and can read the
+// user's real key, so this suite never hands its own HOME on: every spawn that passes no env, or
+// spreads process.env, inherits this throwaway one.
+const SUITE_HOME = makeTmpDir();
+process.on("exit", () => rmSync(SUITE_HOME, { recursive: true, force: true }));
+process.env.HOME = SUITE_HOME;
+process.env.USERPROFILE = SUITE_HOME;
+
 // Set up a fake $HOME with an empty .codex/ subdir. Registers an `after` hook
 // on `t` that nukes the temp dir even if the test throws, so failed assertions
 // don't leak directories under /tmp.
@@ -31,6 +39,12 @@ function setupCodexHome(t) {
   const configPath = join(codexDir, "config.toml");
   t.after(() => rmSync(tmpDir, { recursive: true, force: true }));
   return { tmpDir, codexDir, configPath };
+}
+
+// Each test gets its own HOME, so state one test leaves (a recall cooldown, say) never reaches the next.
+function isolatedEnv(t, extra) {
+  const { tmpDir } = setupCodexHome(t);
+  return { ...process.env, HOME: tmpDir, USERPROFILE: tmpDir, ...extra };
 }
 
 function runCli(cliBin, cmd, tmpDir) {
@@ -561,6 +575,123 @@ describe("hook recall search mode", () => {
   });
 });
 
+describe("hook recall skips namespaces that are empty", () => {
+  const hookModule = new URL("../dist/services/hookRecallClient.js", import.meta.url).href;
+
+  // Recall reads ten namespaces per prompt and eight of them hold nothing, which spends search quota for no hits.
+  function recall(t, { listStatus = 200, stateBefore, hangList = false, writeTags, tags = ["repo_full", "repo_empty"], timeoutMs = 2000 } = {}) {
+    const { tmpDir } = setupCodexHome(t);
+    const stateFile = join(tmpDir, ".codex-supermemory", "namespace-contents.json");
+    if (stateBefore) {
+      mkdirSync(join(tmpDir, ".codex-supermemory"), { recursive: true });
+      writeFileSync(stateFile, JSON.stringify(stateBefore(Date.now())));
+    }
+    const script = `
+      const totals = { repo_full: 5, repo_empty: 0 };
+      const calls = [];
+      const fetchImpl = async (input) => {
+        const url = new URL(typeof input === "string" ? input : input.url);
+        calls.push(url.pathname);
+        const [, , ns, op, type] = url.pathname.split("/");
+        const json = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+        if (op === "list") {
+          if (${hangList}) return new Promise(() => {});
+          if (${listStatus} !== 200) return json({ error: "boom" }, ${listStatus});
+          const n = totals[ns];
+          return json({ memories: [], documents: [], chunks: [], pagination: { currentPage: 1, limit: 1, totalItems: type === "memories" ? n : 0, totalPages: n } });
+        }
+        return json(ns === "repo_full"
+          ? { results: [{ id: "m1", memory: "chose drizzle", similarity: 0.9 }], total: 1, searchTime: 1 }
+          : { results: [], total: 0, searchTime: 1 });
+      };
+      const mod = await import(${JSON.stringify(hookModule)});
+      const { getHookProfileWithSearchMany } = mod.default ?? mod;
+      const rounds = [];
+      for (let i = 0; i < 2; i++) {
+        calls.length = 0;
+        const started = Date.now();
+        const result = await getHookProfileWithSearchMany(${JSON.stringify(tags)}, "what did we pick",
+          { fetchImpl, timeoutMs: ${timeoutMs}, writeTags: ${JSON.stringify(writeTags ?? [])} });
+        rounds.push({ calls: [...calls].sort(), hits: result.searchResults?.results?.length ?? 0, success: result.success, elapsed: Date.now() - started });
+      }
+      console.log(JSON.stringify(rounds));
+    `;
+    const result = spawnSync("node", ["--input-type=module", "-e", script], {
+      env: {
+        ...process.env,
+        HOME: tmpDir,
+        USERPROFILE: tmpDir,
+        SUPERMEMORY_CODEX_API_KEY: "sm_test_empty_fixture",
+        SUPERMEMORY_API_URL: "https://api.supermemory.ai",
+        SUPERMEMORY_API_VERSION: "v5",
+      },
+      encoding: "utf-8",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    return { rounds: JSON.parse(result.stdout), state: existsSync(stateFile) ? JSON.parse(readFileSync(stateFile, "utf-8")) : {} };
+  }
+
+  test("checks contents once, then skips an empty namespace and stops listing a full one", (t) => {
+    const { rounds, state } = recall(t);
+    assert.ok(rounds[0].calls.includes("/ns/repo_empty/search"));
+    assert.ok(rounds[0].calls.includes("/ns/repo_empty/list/memories"));
+    assert.ok(rounds[0].calls.includes("/ns/repo_empty/list/documents"));
+    assert.deepEqual(rounds[1].calls, ["/ns/repo_full/search"]);
+    assert.equal(rounds[1].hits, 1);
+    assert.equal(state.repo_empty.empty, true);
+    assert.equal(state.repo_full.empty, false);
+  });
+
+  test("searches an empty namespace again once its check is six hours old", (t) => {
+    const old = (now) => ({ repo_empty: { empty: true, checkedAt: now - 6 * 60 * 60 * 1000 - 1 }, repo_full: { empty: false, checkedAt: now } });
+    const { rounds, state } = recall(t, { stateBefore: old });
+    assert.ok(rounds[0].calls.includes("/ns/repo_empty/search"));
+    assert.ok(rounds[0].calls.includes("/ns/repo_empty/list/memories"));
+    assert.ok(state.repo_empty.checkedAt > Date.now() - 60_000);
+  });
+
+  test("a failed list never marks a namespace empty and is not retried on every prompt", (t) => {
+    const { rounds, state } = recall(t, { listStatus: 500 });
+    assert.ok(rounds[1].calls.includes("/ns/repo_empty/search"));
+    assert.ok(!rounds[1].calls.some((path) => path.includes("/list/")));
+    assert.equal(rounds[1].hits, 1);
+    assert.equal(state.repo_empty.empty, false);
+  });
+
+  test("a list call that hangs never holds the prompt past the recall budget", (t) => {
+    const { rounds, state } = recall(t, { hangList: true, timeoutMs: 300 });
+    assert.equal(rounds[0].hits, 1);
+    assert.ok(rounds[0].elapsed < 1500, `took ${rounds[0].elapsed} ms`);
+    assert.equal(state.repo_empty?.empty, false);
+  });
+
+  test("never skips a namespace this plugin writes to", (t) => {
+    const marked = (now) => ({ repo_empty: { empty: true, checkedAt: now } });
+    const { rounds } = recall(t, { stateBefore: marked, writeTags: ["repo_empty"] });
+    assert.ok(rounds[0].calls.includes("/ns/repo_empty/search"));
+  });
+
+  test("all namespaces empty is a successful recall with no hits", (t) => {
+    const marked = (now) => ({ repo_empty: { empty: true, checkedAt: now } });
+    const { rounds } = recall(t, { stateBefore: marked, tags: ["repo_empty"] });
+    assert.equal(rounds[0].success, true);
+    assert.equal(rounds[0].hits, 0);
+    assert.deepEqual(rounds[0].calls, []);
+  });
+
+  test("a check dated in the future is not trusted", (t) => {
+    const ahead = (now) => ({ repo_empty: { empty: true, checkedAt: now + 24 * 60 * 60 * 1000 } });
+    const { rounds } = recall(t, { stateBefore: ahead });
+    assert.ok(rounds[0].calls.includes("/ns/repo_empty/search"));
+  });
+
+  test("a broken state file is ignored, not fatal", (t) => {
+    const { rounds } = recall(t, { stateBefore: () => "not an object" });
+    assert.ok(rounds[0].calls.includes("/ns/repo_empty/search"));
+    assert.equal(rounds[0].success, true);
+  });
+});
+
 describe("hook recall requests", () => {
   const hookModule = new URL("../dist/services/hookRecallClient.js", import.meta.url).href;
 
@@ -597,7 +728,9 @@ describe("hook recall requests", () => {
     });
     assert.equal(result.status, 0, result.stderr);
     const out = JSON.parse(result.stdout);
-    assert.deepEqual(out.paths, ["/ns/repo_req_test/search"]);
+    // Content checks of a namespace seen for the first time are list calls, not /profile.
+    assert.deepEqual(out.paths.filter((path) => !path.includes("/list/")), ["/ns/repo_req_test/search"]);
+    assert.equal(out.paths.filter((path) => path.includes("/list/")).length, 2);
     assert.equal(out.success, true);
     assert.equal(out.hits, 1);
   });
@@ -802,7 +935,7 @@ describe("capture tracker", () => {
 describe("hook SDK request bounds", () => {
   const clientModule = new URL("../dist/services/client.js", import.meta.url).href;
 
-  test("aborts the SDK fetch without retries", () => {
+  test("aborts the SDK fetch without retries", (t) => {
     const script = `
       import { SupermemoryClient } from ${JSON.stringify(clientModule)};
       let calls = 0;
@@ -821,7 +954,7 @@ describe("hook SDK request bounds", () => {
       console.log(JSON.stringify({ success: result.success, calls, aborted, elapsed: Date.now() - started }));
     `;
     const result = spawnSync("node", ["--input-type=module", "-e", script], {
-      env: { ...process.env, SUPERMEMORY_CODEX_API_KEY: "sm_test" },
+      env: isolatedEnv(t, { SUPERMEMORY_CODEX_API_KEY: "sm_test" }),
       encoding: "utf-8",
       timeout: 1_000,
     });
@@ -904,7 +1037,7 @@ describe("direct recall policy", () => {
     });
   });
 
-  test("aborts hook-only profile fetches and fails open", () => {
+  test("aborts hook-only profile fetches and fails open", (t) => {
     const script = `
       import { getHookProfileWithSearchMany } from ${JSON.stringify(hookClientModule)};
       const fetchImpl = (_url, { signal }) => new Promise((_resolve, reject) => {
@@ -918,7 +1051,7 @@ describe("direct recall policy", () => {
       console.log(JSON.stringify({ success: result.success, elapsed: Date.now() - started }));
     `;
     const result = spawnSync("node", ["--input-type=module", "-e", script], {
-      env: { ...process.env, SUPERMEMORY_CODEX_API_KEY: "sm_test" },
+      env: isolatedEnv(t, { SUPERMEMORY_CODEX_API_KEY: "sm_test" }),
       encoding: "utf-8",
       timeout: 1_000,
     });
@@ -959,17 +1092,17 @@ describe("direct recall policy", () => {
     assert.equal(output.invalid, 3000);
   });
 
-  test("default recall timeout follows SUPERMEMORY_API_URL", () => {
+  test("default recall timeout follows SUPERMEMORY_API_URL", (t) => {
     const script = `
       import { hookRecallTimeoutMs } from ${JSON.stringify(hookClientModule)};
       console.log(hookRecallTimeoutMs());
     `;
     const hosted = spawnSync("node", ["--input-type=module", "-e", script], {
-      env: { ...process.env, SUPERMEMORY_API_URL: "https://api.supermemory.ai" },
+      env: isolatedEnv(t, { SUPERMEMORY_API_URL: "https://api.supermemory.ai" }),
       encoding: "utf-8",
     });
     const selfHosted = spawnSync("node", ["--input-type=module", "-e", script], {
-      env: { ...process.env, SUPERMEMORY_API_URL: "http://127.0.0.1:6767" },
+      env: isolatedEnv(t, { SUPERMEMORY_API_URL: "http://127.0.0.1:6767" }),
       encoding: "utf-8",
     });
     assert.equal(hosted.status, 0, hosted.stderr);
@@ -1470,20 +1603,20 @@ describe("recall hook output envelope", () => {
     );
   });
 
-  test("emits no envelope on empty prompt (so Codex doesn't render an empty hook context line)", () => {
+  test("emits no envelope on empty prompt (so Codex doesn't render an empty hook context line)", (t) => {
     const result = spawnSync("node", [recallBin], {
       input: JSON.stringify({ session_id: "s1", prompt: "" }),
-      env: { ...process.env, SUPERMEMORY_CODEX_API_KEY: "sm_test" },
+      env: isolatedEnv(t, { SUPERMEMORY_CODEX_API_KEY: "sm_test" }),
       encoding: "utf-8",
     });
     assert.equal(result.status, 0);
     assert.equal(result.stdout, "", "empty context should produce empty stdout");
   });
 
-  test("emits no envelope on malformed JSON input", () => {
+  test("emits no envelope on malformed JSON input", (t) => {
     const result = spawnSync("node", [recallBin], {
       input: "not-json",
-      env: { ...process.env, SUPERMEMORY_CODEX_API_KEY: "sm_test" },
+      env: isolatedEnv(t, { SUPERMEMORY_CODEX_API_KEY: "sm_test" }),
       encoding: "utf-8",
     });
     assert.equal(result.status, 0);
@@ -1640,28 +1773,28 @@ describe("search_hybrid local MCP tool", () => {
 describe("flush hook Stop payload", () => {
   const flushBin = fileURLToPath(new URL("../dist/hooks/flush.js", import.meta.url));
 
-  test("exits 0 with no transcript_path", () => {
+  test("exits 0 with no transcript_path", (t) => {
     const result = spawnSync("node", [flushBin], {
       input: JSON.stringify({ session_id: "s1", transcript_path: null }),
-      env: { ...process.env, SUPERMEMORY_CODEX_API_KEY: "" },
+      env: isolatedEnv(t, { SUPERMEMORY_CODEX_API_KEY: "" }),
       encoding: "utf-8",
     });
     assert.equal(result.status, 0);
   });
 
-  test("exits 0 when not configured", () => {
+  test("exits 0 when not configured", (t) => {
     const result = spawnSync("node", [flushBin], {
       input: JSON.stringify({ session_id: "s1", cwd: "/tmp" }),
-      env: { ...process.env, SUPERMEMORY_CODEX_API_KEY: "" },
+      env: isolatedEnv(t, { SUPERMEMORY_CODEX_API_KEY: "" }),
       encoding: "utf-8",
     });
     assert.equal(result.status, 0);
   });
 
-  test("exits 0 on malformed JSON input", () => {
+  test("exits 0 on malformed JSON input", (t) => {
     const result = spawnSync("node", [flushBin], {
       input: "not-json",
-      env: { ...process.env, SUPERMEMORY_CODEX_API_KEY: "" },
+      env: isolatedEnv(t, { SUPERMEMORY_CODEX_API_KEY: "" }),
       encoding: "utf-8",
     });
     assert.equal(result.status, 0);
@@ -1685,19 +1818,19 @@ describe("flush hook Stop payload", () => {
         transcript_path: transcriptFile,
         cwd: tmpDir,
       }),
-      env: { ...process.env, SUPERMEMORY_CODEX_API_KEY: "" },
+      env: isolatedEnv(t, { SUPERMEMORY_CODEX_API_KEY: "" }),
       encoding: "utf-8",
     });
     assert.equal(result.status, 0);
   });
 
-  test("does not crash when transcript_path points to nonexistent file", () => {
+  test("does not crash when transcript_path points to nonexistent file", (t) => {
     const result = spawnSync("node", [flushBin], {
       input: JSON.stringify({
         session_id: "s1",
         transcript_path: "/nonexistent/path/transcript.jsonl",
       }),
-      env: { ...process.env, SUPERMEMORY_CODEX_API_KEY: "" },
+      env: isolatedEnv(t, { SUPERMEMORY_CODEX_API_KEY: "" }),
       encoding: "utf-8",
     });
     assert.equal(result.status, 0);
