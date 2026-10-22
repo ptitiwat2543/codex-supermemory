@@ -4,8 +4,9 @@ import { getTags } from "../services/tags.js";
 import { log } from "../services/logger.js";
 import { getSeenFacts, addSeenFacts, factKey } from "../services/factCache.js";
 import { getSessionId } from "../services/session.js";
-import { getHookProfileWithSearchMany } from "../services/hookRecallClient.js";
+import { getHookProfileWithSearchMany, hookRecallTimeoutMs } from "../services/hookRecallClient.js";
 import { prepareRecallQuery, shouldRecallPrompt } from "../services/recallPolicy.js";
+import { createWarmFetch } from "../services/warmRecallTransport.js";
 
 const MAX_RESULT_CHARS = 300;
 
@@ -114,7 +115,7 @@ async function main() {
     const profileResult = await getHookProfileWithSearchMany(
       tags.allReads,
       prepareRecallQuery(query),
-      { writeTags: [tags.canonical] },
+      { writeTags: [tags.canonical], fetchImpl: createWarmFetch({ budgetMs: hookRecallTimeoutMs(), onResult: (report) => log("recall: warm", report) }) },
     );
 
     if (!profileResult.success) {

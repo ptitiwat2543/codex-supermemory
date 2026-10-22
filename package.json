@@ -10,7 +10,7 @@
   "scripts": {
     "build": "node build.mjs",
     "typecheck": "tsc --noEmit",
-    "test": "npm run build && node --test test/unit.mjs"
+    "test": "npm run build && node --test --test-concurrency=1 test/unit.mjs test/warm-transport.mjs && python3 -B test/warm-helper.py && python3 -B test/warm-autostart.py"
   },
   "keywords": [
     "codex",

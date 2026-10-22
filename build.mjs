@@ -48,6 +48,7 @@ mkdirSync("dist", { recursive: true });
 writeFileSync("dist/THIRD_PARTY_LICENSES", sdkLicenses);
 
 const libraryEntries = [
+  { in: "src/services/warmRecallTransport.ts", out: "dist/services/warmRecallTransport.js" },
   { in: "src/services/session.ts", out: "dist/services/session.js" },
   { in: "src/services/tags.ts", out: "dist/services/tags.js" },
   { in: "src/services/resultMerge.ts", out: "dist/services/resultMerge.js" },
@@ -82,6 +83,7 @@ await Promise.all(
 );
 
 // Copy SKILL.md files to dist
+copyFileSync("src/hooks/recall-warm.py", "dist/hooks/recall-warm.py");
 for (const skillName of ["supermemory-status", "supermemory-index"]) {
   mkdirSync(`dist/skills/${skillName}`, { recursive: true });
   copyFileSync(
