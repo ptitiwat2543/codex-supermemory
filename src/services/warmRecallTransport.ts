@@ -8,6 +8,7 @@ import { spawn } from "node:child_process";
 const ACK_MS = 200;
 const DEFAULT_BUDGET_MS = 3000; // the hosted search deadline; recall.ts passes the real one
 const BACKOFF_MS = 60_000;
+const HELPER_IDLE_SECONDS = "1800"; // prompts come minutes apart (23/10: 84% of gaps <= 1800 s, 28% <= 120 s)
 const MAX_FRAME = 12 * 1024 * 1024;
 const READ_PATH = /^\/(?:v5\/)?ns\/[^/]+\/(?:search|list\/(?:memories|documents))\/?$/;
 /** One line of evidence per fetch: did the helper serve it, and if not why. Never carries request content. */
@@ -143,7 +144,7 @@ export function createWarmFetch(options: WarmOptions = {}): typeof fetch {
     started = true;
     touch(path, "last-spawn"); // before spawning: a start that fails must not repeat on the next prompt
     try {
-      const child = spawn("/usr/bin/python3", ["-I", join(__dirname, "recall-warm.py"), "--socket", path], {
+      const child = spawn("/usr/bin/python3", ["-I", join(__dirname, "recall-warm.py"), "--socket", path, "--idle-seconds", HELPER_IDLE_SECONDS], {
         detached: true, stdio: "ignore", env: { PATH: "/usr/bin:/bin", LANG: "C.UTF-8" },
       });
       child.on("error", () => {}); child.unref();

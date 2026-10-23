@@ -12,7 +12,7 @@ cp.spawn=(exe,args,opts)=>{
  if(exe!=='/usr/bin/python3'||!args.includes('--socket'))throw Error('unexpected spawn');
  if(Object.keys(opts.env).some(k=>/KEY|TOKEN|SECRET/.test(k)))throw Error('credential inherited');
  fs.writeFileSync(process.env.PROOF,JSON.stringify({exe,args,keys:Object.keys(opts.env)}));
- return spawn(exe,[...args,'--idle-seconds','0.3'],opts);
+ return spawn(exe,[...args,'--idle-seconds','0.3'],opts); // argparse keeps the last value, so the helper exits fast here
 };
 global.fetch=async(u,i)=>{
  if(!/\\/(search|list\\/(memories|documents))$/.test(new URL(u).pathname))throw Error('not read');
@@ -33,6 +33,8 @@ global.fetch=async(u,i)=>{
  assert 'fresh hook fallback' in x.stdout,x.stdout
  proof=json.loads((home/'proof.json').read_text());sock=Path(proof['args'][proof['args'].index('--socket')+1])
  assert proof['args'][1]==str(ROOT/'dist/hooks/recall-warm.py'),proof
+ # the hook asks for a helper that outlives the minutes between prompts
+ assert '--idle-seconds' in proof['args'] and proof['args'][proof['args'].index('--idle-seconds')+1]=='1800',proof
  seen=False
  for _ in range(150):
   if sock.exists():seen=True

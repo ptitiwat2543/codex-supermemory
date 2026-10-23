@@ -56,6 +56,24 @@ class Tests(unittest.TestCase):
    transport=h.Transport()
    for _ in range(2):transport.request('/ns/test/search',{'Authorization':'fixture'},b'{"query":"fresh"}')
    self.assertEqual(len(connections),1);self.assertEqual(len(connections[0].calls),2);transport.close()
+ def test_pooled_connection_idle_past_the_limit_is_closed_unused(self):
+  # A NAT may drop an idle connection without a reset; sending on it would only fail at the deadline.
+  connections=[]
+  class Response:
+   status=200;will_close=False;length=0
+   def read(self,n):return b'{"results":[]}'
+   def getheader(self,*a):return 'application/json'
+  class Connection:
+   sock=None
+   def __init__(self,*a,**k):self.calls=[];self.closed=False;connections.append(self)
+   def connect(self):pass
+   def request(self,*a,**k):self.calls.append((a,k))
+   def getresponse(self):return Response()
+   def close(self):self.closed=True
+  with patch.object(h.http.client,'HTTPSConnection',Connection),patch.object(h,'POOL_IDLE',0.0):
+   transport=h.Transport()
+   for _ in range(2):transport.request('/ns/test/search',{'Authorization':'fixture'},b'{"query":"fresh"}')
+   self.assertEqual(len(connections),2);self.assertEqual(len(connections[0].calls),1);self.assertTrue(connections[0].closed);transport.close()
 class Upstream:
  """Plain HTTP/1.1 server on localhost standing in for the provider; script(sock, connection_no, request_no) decides each reply."""
  def __init__(self,script):

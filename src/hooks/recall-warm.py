@@ -25,6 +25,9 @@ DEFAULT_BUDGET = 3.0  # seconds; the hook's hosted search deadline, used when a 
 MAX_BUDGET = 10.0
 MIN_ATTEMPT = 0.05  # not worth opening a connection with less time than this
 HEARTBEAT = 0.1
+# seconds; the helper lives 30 min between prompts, but a NAT may drop an idle connection without a reset,
+# and a POST on it would only fail at the deadline. A fresh TLS connection costs ~50 ms (23/10).
+POOL_IDLE = 120.0
 READ_PATH = re.compile(r"/(?:v5/)?ns/[^/]+/(?:search|list/(?:memories|documents))/?\Z")
 
 
@@ -85,7 +88,10 @@ class Transport:
         """One POST before `deadline` (time.monotonic). A pooled connection the server already dropped is replaced once."""
         deadline = deadline or time.monotonic() + DEFAULT_BUDGET
         with self.lock:
-            connection = self.pool.pop() if self.pool else None
+            connection, idle_since = self.pool.pop() if self.pool else (None, 0.0)
+        if connection is not None and time.monotonic() - idle_since > POOL_IDLE:
+            connection.close()
+            connection = None
         reused = connection is not None
         while True:
             remaining = deadline - time.monotonic()
@@ -128,12 +134,12 @@ class Transport:
             watchdog.cancel()
             if keep:
                 with self.lock:
-                    self.pool.append(connection)
+                    self.pool.append((connection, time.monotonic()))
             else:
                 connection.close()
 
     def close(self):
-        for connection in self.pool:
+        for connection, _ in self.pool:
             connection.close()
 
 
